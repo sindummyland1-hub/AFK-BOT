@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const login = require("ws3-fca");
+const { login } = require("ws3-fca");
 
 // ---------- LOAD CONFIG ----------
 const config = JSON.parse(fs.readFileSync("config.json"));
