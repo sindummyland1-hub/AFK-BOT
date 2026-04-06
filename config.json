@@ -1,0 +1,12 @@
+{
+  "email": "your_email",
+  "password": "your_password",
+  "useAppState": true,
+
+  "adminID": "61579551575273",
+  "threadID": "1511007497133852",
+
+  "min_delay": 4000,
+  "max_delay": 8000,
+  "cycle_cooldown": 30000
+}
