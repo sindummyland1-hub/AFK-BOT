@@ -1,68 +1,50 @@
 const fs = require("fs");
 const path = require("path");
 const { login } = require("ws3-fca");
+const express = require("express");
 
 // ---------- LOAD CONFIG ----------
-const config = JSON.parse(fs.readFileSync("config.json"));
+let config;
+try {
+  config = JSON.parse(fs.readFileSync("config.json"));
+} catch (e) {
+  console.error("[Config Error] Failed to read config.json", e);
+  process.exit(1);
+}
 
 // ---------- GLOBAL ----------
 let api = null;
 let runningThreads = {}; // stores active thread loops
 
 // ---------- UTIL ----------
-function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms));
-}
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+const randomDelay = () => Math.random() * (config.max_delay - config.min_delay) + config.min_delay;
+const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
 
-function randomDelay() {
-  return Math.random() * (config.max_delay - config.min_delay) + config.min_delay;
-}
-
-function shuffle(arr) {
-  return arr.sort(() => Math.random() - 0.5);
-}
-
-// ✅ NEW: typing + send
-async function sendWithTyping(threadID, message) {
-  try {
-    api.sendTypingIndicator(threadID, true);
-    const typingTime = Math.min(
-      5000,
-      message.length * (30 + Math.random() * 40)
-    );
-    await sleep(typingTime);
-    await api.sendMessage(message, threadID);
-    api.sendTypingIndicator(threadID, false);
-    console.log(`[Send][${threadID}] ✅`, message);
-  } catch (e) {
-    console.log(`[Send][${threadID}] ❌`, e.error || e);
-  }
-}
-
-// ---------- FILE SYSTEM ----------
+// ---------- MESSAGES ----------
 const MESSAGE_DIR = "./messages";
-
-function getMessageFiles() {
+const getMessageFiles = () => {
   if (!fs.existsSync(MESSAGE_DIR)) {
     console.log("[Files] messages folder missing!");
     return [];
   }
+  return fs.readdirSync(MESSAGE_DIR).filter(f => f.endsWith(".txt"));
+};
+const loadMessages = (file) => shuffle(fs.readFileSync(path.join(MESSAGE_DIR, file), "utf-8")
+  .split("\n").map(x => x.trim()).filter(Boolean));
 
-  const files = fs.readdirSync(MESSAGE_DIR)
-    .filter(f => f.endsWith(".txt"));
-
-  console.log("[Files] Found:", files);
-  return files;
-}
-
-function loadMessages(file) {
-  const fullPath = path.join(MESSAGE_DIR, file);
-  const msgs = fs.readFileSync(fullPath, "utf-8")
-    .split("\n")
-    .map(x => x.trim())
-    .filter(Boolean);
-
-  return shuffle(msgs);
+// ---------- SEND WITH TYPING ----------
+async function sendWithTyping(threadID, message) {
+  try {
+    api.sendTypingIndicator(threadID, true);
+    const typingTime = Math.min(5000, message.length * (30 + Math.random() * 40));
+    await sleep(typingTime);
+    await api.sendMessage(message, threadID);
+    api.sendTypingIndicator(threadID, false);
+    console.log(`[Send][${threadID}] ✅ ${message}`);
+  } catch (e) {
+    console.log(`[Send][${threadID}] ❌`, e.error || e);
+  }
 }
 
 // ---------- SENDING LOOP ----------
@@ -76,11 +58,10 @@ async function sendingLoop(threadID) {
   while (runningThreads[threadID]) {
     const file = files[fileIndex];
     const messages = loadMessages(file);
-
     console.log(`[Cycle][${threadID}] Using file: ${file}`);
 
-    for (let msg of messages) {
-      if (!runningThreads[threadID]) return; // stop if thread is stopped
+    for (const msg of messages) {
+      if (!runningThreads[threadID]) return;
       await sendWithTyping(threadID, msg);
       await sleep(randomDelay());
     }
@@ -97,7 +78,7 @@ async function sendingLoop(threadID) {
 // ---------- COMMAND LISTENER ----------
 function startListener() {
   api.listenMqtt((err, event) => {
-    if (err) return console.error(err);
+    if (err) return console.error("[MQTT Error]", err);
     if (event.type !== "message" || !event.body) return;
 
     const msg = event.body.toLowerCase().trim();
@@ -105,43 +86,32 @@ function startListener() {
 
     const currentThread = event.threadID;
 
-    // start [optional threadID]
     if (msg.startsWith("start")) {
       const parts = msg.split(" ");
       const targetThread = parts[1] ? parts[1].trim() : currentThread || config.threadID;
+      if (!targetThread) return api.sendMessage("❌ No thread ID provided!", currentThread);
 
-      if (!targetThread) {
-        return api.sendMessage("❌ No thread ID provided and config.threadID is missing!", currentThread);
-      }
-
-      if (runningThreads[targetThread]) {
-        return api.sendMessage(`⚠️ Bot already running on thread: ${targetThread}`, currentThread);
-      }
+      if (runningThreads[targetThread]) return api.sendMessage(`⚠️ Bot already running on thread: ${targetThread}`, currentThread);
 
       runningThreads[targetThread] = true;
-      sendingLoop(targetThread); // start independent loop
+      sendingLoop(targetThread);
       api.sendMessage(`✅ Bot started on thread: ${targetThread}`, currentThread);
     }
 
-    // stop [optional threadID]
     if (msg.startsWith("stop")) {
       const parts = msg.split(" ");
       const targetThread = parts[1] ? parts[1].trim() : currentThread;
 
       if (targetThread) {
-        if (!runningThreads[targetThread]) {
-          return api.sendMessage(`⚠️ Bot is not running on thread: ${targetThread}`, currentThread);
-        }
+        if (!runningThreads[targetThread]) return api.sendMessage(`⚠️ Bot is not running on thread: ${targetThread}`, currentThread);
         runningThreads[targetThread] = false;
         api.sendMessage(`🛑 Bot stopped on thread: ${targetThread}`, currentThread);
       } else {
-        // if no threadID, stop all
         for (let t in runningThreads) runningThreads[t] = false;
         api.sendMessage("🛑 Bot stopped on all threads.", currentThread);
       }
     }
 
-    // stop all
     if (msg === "stopall") {
       for (let t in runningThreads) runningThreads[t] = false;
       api.sendMessage("🛑 Bot stopped on all threads.", currentThread);
@@ -155,25 +125,33 @@ function startBot() {
     ? { appState: JSON.parse(fs.readFileSync("appstate.json")) }
     : { email: config.email, password: config.password };
 
+  console.log("[Login] Attempting login...");
+
   login(loginData, (err, apiInstance) => {
-    if (err) {
-      console.error("[Login Error]", err);
-      return;
-    }
+    if (err) return console.error("[Login Error]", err);
 
     api = apiInstance;
     console.log("[Login] ✅ Success");
 
-    // save session
-    fs.writeFileSync(
-      "appstate.json",
-      JSON.stringify(api.getAppState(), null, 2)
-    );
-
+    fs.writeFileSync("appstate.json", JSON.stringify(api.getAppState(), null, 2));
     startListener();
   });
+
+  // timeout to prevent indefinite hang
+  setTimeout(() => {
+    if (!api) console.warn("[Login Warning] Login may be stuck, check credentials or appState.");
+  }, 30000);
 }
 
-// ---------- START ----------
-console.log("=== FCA RENDER BOT STARTING ===");
-startBot();
+// ---------- EXPRESS SERVER ----------
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.send("<h1 style='text-align:center;margin-top:50px;'>BOT IS RUNNING!</h1>");
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Render server started on port ${PORT}`);
+  startBot(); // start bot AFTER server is listening
+});
