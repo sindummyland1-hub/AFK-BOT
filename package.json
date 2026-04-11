@@ -1,10 +1,13 @@
 {
-  "name": "fca-bot-render",
+  "name": "fb-bot-autoreact",
   "version": "1.0.0",
+  "description": "Messenger bot with spam, count, and autoreact",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
     "ws3-fca": "*"
