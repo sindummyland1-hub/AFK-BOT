@@ -1,157 +1,266 @@
 const fs = require("fs");
-const path = require("path");
 const { login } = require("ws3-fca");
 const express = require("express");
 
-// ---------- LOAD CONFIG ----------
+// ---------- CRASH PROTECTION ----------
+process.on("uncaughtException", err => console.log("[UNCAUGHT]", err));
+process.on("unhandledRejection", err => {
+  const msg = err?.toString?.() || "";
+  if (msg.includes("[object Object]")) return;
+  console.log("[REJECTION]", msg);
+});
+
+// ---------- CONFIG ----------
 let config;
 try {
   config = JSON.parse(fs.readFileSync("config.json"));
-} catch (e) {
-  console.error("[Config Error] Failed to read config.json", e);
+} catch {
   process.exit(1);
 }
 
 // ---------- GLOBAL ----------
 let api = null;
-let runningThreads = {}; // stores active thread loops
+const OWNER_ID = config.adminID;
 
-// ---------- UTIL ----------
-const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-const randomDelay = () => Math.random() * (config.max_delay - config.min_delay) + config.min_delay;
-const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
+// ---------- AUTOREACT ----------
+let autoReactEnabled = false;
+const AUTO_REACT_EMOJI = "😆";
 
-// ---------- MESSAGES ----------
-const MESSAGE_DIR = "./messages";
-const getMessageFiles = () => {
-  if (!fs.existsSync(MESSAGE_DIR)) {
-    console.log("[Files] messages folder missing!");
-    return [];
-  }
-  return fs.readdirSync(MESSAGE_DIR).filter(f => f.endsWith(".txt"));
-};
-const loadMessages = (file) => shuffle(fs.readFileSync(path.join(MESSAGE_DIR, file), "utf-8")
-  .split("\n").map(x => x.trim()).filter(Boolean));
-
-// ---------- SEND WITH TYPING ----------
-async function sendWithTyping(threadID, message) {
+async function autoReact(threadID, messageID) {
+  if (!autoReactEnabled || !api || !messageID) return;
   try {
-    api.sendTypingIndicator(threadID, true);
-    const typingTime = Math.min(5000, message.length * (30 + Math.random() * 40));
-    await sleep(typingTime);
-    await api.sendMessage(message, threadID);
-    api.sendTypingIndicator(threadID, false);
-    console.log(`[Send][${threadID}] ✅ ${message}`);
-  } catch (e) {
-    console.log(`[Send][${threadID}] ❌`, e.error || e);
-  }
+    await api.setMessageReaction(AUTO_REACT_EMOJI, messageID, () => {}, true);
+  } catch {}
 }
 
-// ---------- SENDING LOOP ----------
-async function sendingLoop(threadID) {
-  const files = getMessageFiles();
-  if (!files.length) return;
+// ---------- SEND + TYPING ----------
+async function sendMessageCompat(text, threadID) {
+  if (!api) return false;
 
-  let fileIndex = 0;
-  console.log(`[Loop][${threadID}] Started sending messages.`);
-
-  while (runningThreads[threadID]) {
-    const file = files[fileIndex];
-    const messages = loadMessages(file);
-    console.log(`[Cycle][${threadID}] Using file: ${file}`);
-
-    for (const msg of messages) {
-      if (!runningThreads[threadID]) return;
-      await sendWithTyping(threadID, msg);
-      await sleep(randomDelay());
+  try {
+    if (api.sendTypingIndicator) {
+      api.sendTypingIndicator(threadID, true);
     }
 
-    console.log(`[Cooldown][${threadID}] Waiting before next cycle...`);
-    await sleep(config.cycle_cooldown);
+    const info = await api.sendMessage(text, threadID);
 
-    fileIndex = (fileIndex + 1) % files.length;
+    if (api.sendTypingIndicator) {
+      api.sendTypingIndicator(threadID, false);
+    }
+
+    if (info?.messageID) {
+      autoReact(threadID, info.messageID);
+    }
+
+    return true;
+
+  } catch {
+    console.log("[SEND BLOCKED]", threadID);
+
+    try {
+      api.sendTypingIndicator(threadID, false);
+    } catch {}
+
+    return false;
   }
-
-  console.log(`[Loop][${threadID}] Stopped.`);
 }
 
-// ---------- COMMAND LISTENER ----------
+// ---------- SPAM ----------
+const stateFile = "./spam_state.json";
+
+let persisted = {};
+try {
+  if (fs.existsSync(stateFile)) {
+    persisted = JSON.parse(fs.readFileSync(stateFile));
+  }
+} catch {}
+
+persisted.lists = persisted.lists || {};
+persisted.active = persisted.active || {};
+
+let spamIndexes = {};
+let lastReplyTime = {};
+
+function saveState() {
+  fs.writeFileSync(stateFile, JSON.stringify(persisted, null, 2));
+}
+
+function getDelay() {
+  return 8000 + Math.random() * 4000;
+}
+
+// ---------- COUNT ----------
+let activeCounts = {};
+
+// ---------- HELPERS ----------
+function looksLikeThreadID(t) {
+  return /^\d{6,}$/.test(t);
+}
+
+function startSpam(tid) {
+  persisted.active[tid] = true;
+  if (typeof spamIndexes[tid] !== "number") spamIndexes[tid] = 0;
+  saveState();
+}
+
+function stopSpam(tid) {
+  delete persisted.active[tid];
+  saveState();
+}
+
+// ---------- LISTENER ----------
 function startListener() {
-  api.listenMqtt((err, event) => {
-    if (err) return console.error("[MQTT Error]", err);
-    if (event.type !== "message" || !event.body) return;
+  api.listenMqtt(async (err, event) => {
 
-    const msg = event.body.toLowerCase().trim();
-    if (event.senderID !== config.adminID) return;
-
-    const currentThread = event.threadID;
-
-    if (msg.startsWith("start")) {
-      const parts = msg.split(" ");
-      const targetThread = parts[1] ? parts[1].trim() : currentThread || config.threadID;
-      if (!targetThread) return api.sendMessage("❌ No thread ID provided!", currentThread);
-
-      if (runningThreads[targetThread]) return api.sendMessage(`⚠️ Bot already running on thread: ${targetThread}`, currentThread);
-
-      runningThreads[targetThread] = true;
-      sendingLoop(targetThread);
-      api.sendMessage(`✅ Bot started on thread: ${targetThread}`, currentThread);
+    if (err) {
+      console.log("[MQTT ERROR]");
+      setTimeout(startListener, 10000);
+      return;
     }
 
-    if (msg.startsWith("stop")) {
-      const parts = msg.split(" ");
-      const targetThread = parts[1] ? parts[1].trim() : currentThread;
+    if (!event || event.type !== "message" || !event.body) return;
 
-      if (targetThread) {
-        if (!runningThreads[targetThread]) return api.sendMessage(`⚠️ Bot is not running on thread: ${targetThread}`, currentThread);
-        runningThreads[targetThread] = false;
-        api.sendMessage(`🛑 Bot stopped on thread: ${targetThread}`, currentThread);
+    const raw = event.body.trim();
+    const lower = raw.toLowerCase();
+    const args = raw.split(/\s+/);
+
+    const threadID = event.threadID;
+    const senderID = event.senderID;
+    const isOwner = senderID == OWNER_ID;
+
+    // ---------- AUTOREACT ----------
+    if (lower === "autoreact on" && isOwner) {
+      autoReactEnabled = true;
+      return sendMessageCompat("autoreact enabled", threadID);
+    }
+
+    if (lower === "autoreact off" && isOwner) {
+      autoReactEnabled = false;
+      return sendMessageCompat("autoreact disabled", threadID);
+    }
+
+    // ---------- COUNT (ULTRA FAST) ----------
+    if (lower.startsWith("count") && isOwner) {
+
+      let target = threadID;
+      let max;
+
+      if (args.length === 2) {
+        max = parseInt(args[1]);
+      } else if (args.length === 3 && looksLikeThreadID(args[1])) {
+        target = args[1];
+        max = parseInt(args[2]);
       } else {
-        for (let t in runningThreads) runningThreads[t] = false;
-        api.sendMessage("🛑 Bot stopped on all threads.", currentThread);
+        return sendMessageCompat("usage: count 50 or count THREAD_ID 50", threadID);
       }
+
+      if (!max || isNaN(max)) {
+        return sendMessageCompat("invalid number", threadID);
+      }
+
+      if (activeCounts[target]) {
+        return sendMessageCompat("already counting", threadID);
+      }
+
+      activeCounts[target] = true;
+
+      (async () => {
+        for (let i = 1; i <= max; i++) {
+
+          if (!activeCounts[target]) break;
+
+          const ok = await sendMessageCompat(String(i), target);
+          if (!ok) break;
+
+          // ⚡ SUPER FAST SAFE DELAY
+          await new Promise(r => setTimeout(r, 15));
+        }
+
+        activeCounts[target] = false;
+      })();
+
+      return;
     }
 
-    if (msg === "stopall") {
-      for (let t in runningThreads) runningThreads[t] = false;
-      api.sendMessage("🛑 Bot stopped on all threads.", currentThread);
+    // ---------- STOP COUNT ----------
+    if (lower.startsWith("stopcount") && isOwner) {
+      const target = args[1] || threadID;
+      activeCounts[target] = false;
+      return sendMessageCompat("stopped", threadID);
     }
+
+    // ---------- STOP SPAM ----------
+    if (lower.startsWith("✓") && isOwner) {
+      const target = args[1] || threadID;
+      stopSpam(target);
+      return sendMessageCompat("stopped", threadID);
+    }
+
+    // ---------- ANDAR ----------
+    if (lower.startsWith("andar ") && isOwner) {
+
+      const after = raw.substring(6).trim();
+      const tokens = after.split(" ");
+
+      let target = threadID;
+      let rest = after;
+
+      if (tokens.length > 1 && looksLikeThreadID(tokens[0])) {
+        target = tokens[0];
+        rest = after.substring(tokens[0].length).trim();
+      }
+
+      const list = rest.split(",").map(s => s.trim()).filter(Boolean);
+
+      persisted.lists[target] = list;
+      spamIndexes[target] = 0;
+
+      startSpam(target);
+
+      return sendMessageCompat(`started on ${target}`, threadID);
+    }
+
+    // ---------- AUTO REPLY ----------
+    if (!persisted.active[threadID]) return;
+    if (senderID == api.getCurrentUserID()) return;
+
+    const now = Date.now();
+
+    if (lastReplyTime[threadID] &&
+        now - lastReplyTime[threadID] < getDelay()) return;
+
+    lastReplyTime[threadID] = now;
+
+    const msgs = persisted.lists[threadID] || ["😴", "ok"];
+    const idx = spamIndexes[threadID] % msgs.length;
+
+    setTimeout(async () => {
+      await sendMessageCompat(msgs[idx], threadID);
+    }, getDelay());
+
+    spamIndexes[threadID]++;
   });
 }
 
-// ---------- LOGIN ----------
+// ---------- START ----------
 function startBot() {
-  const loginData = config.useAppState
+  const loginData = fs.existsSync("appstate.json")
     ? { appState: JSON.parse(fs.readFileSync("appstate.json")) }
     : { email: config.email, password: config.password };
 
-  console.log("[Login] Attempting login...");
-
   login(loginData, (err, apiInstance) => {
-    if (err) return console.error("[Login Error]", err);
+    if (err) return console.log(err);
 
     api = apiInstance;
-    console.log("[Login] ✅ Success");
 
     fs.writeFileSync("appstate.json", JSON.stringify(api.getAppState(), null, 2));
+
     startListener();
   });
-
-  // timeout to prevent indefinite hang
-  setTimeout(() => {
-    if (!api) console.warn("[Login Warning] Login may be stuck, check credentials or appState.");
-  }, 30000);
 }
 
-// ---------- EXPRESS SERVER ----------
+// ---------- SERVER ----------
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.get("/", (_, res) => res.send("running"));
 
-app.get("/", (req, res) => {
-  res.send("<h1 style='text-align:center;margin-top:50px;'>BOT IS RUNNING!</h1>");
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Render server started on port ${PORT}`);
-  startBot(); // start bot AFTER server is listening
-});
+app.listen(3000, () => startBot());
