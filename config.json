@@ -1,12 +1,4 @@
 {
-  "email": "northsideako99@gmail.com",
-  "password": "sleepmulti",
-  "useAppState": true,
-
   "adminID": "61579551575273",
-  "threadID": "1446678773133318",
-
-  "min_delay": 4000,
-  "max_delay": 8000,
-  "cycle_cooldown": 30000
+  "useAppState": true
 }
