@@ -32,7 +32,7 @@ const spamTracker = {};
 let autoReactEnabled = false;
 const AUTO_REACT_EMOJI = "😆";
 
-const REACT_LIMIT = 10;
+const REACT_LIMIT = 4;
 const reactTracker = {};
 
 async function autoReact(threadID, messageID) {
@@ -53,7 +53,7 @@ async function autoReact(threadID, messageID) {
 
   tracker.count++;
 
-  const delay = 1000 + Math.random() * 1500;
+  const delay = 4000 + Math.random() * 6000;
 
   setTimeout(async () => {
     try {
